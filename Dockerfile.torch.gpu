@@ -1,0 +1,100 @@
+# =============================================================================
+# DRL Agent container — GPU-accelerated PyTorch, ZERO ROS dependencies.
+# Communication with the ROS2 simulation is handled entirely via Zenoh + pycdr2.
+# =============================================================================
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
+
+ARG USERNAME=vscode
+ARG USER_UID=1001
+ARG USER_GID=$USER_UID
+
+# Create non-root user (eng-ai-agents pattern)
+RUN groupadd --gid $USER_GID $USERNAME \
+  && useradd -s /bin/bash --uid $USER_UID --gid $USER_GID -m $USERNAME \
+  && apt-get update \
+  && apt-get install -y sudo \
+  && echo $USERNAME ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/$USERNAME \
+  && chmod 0440 /etc/sudoers.d/$USERNAME \
+  && echo "source /usr/share/bash-completion/completions/git" >> /home/$USERNAME/.bashrc \
+  && rm -rf /var/lib/apt/lists/*
+
+# System packages (libgl1 + libglib2.0-0 for opencv, libxcb* for Qt5)
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive \
+  apt-get -y install --no-install-recommends \
+  curl git make bash-completion \
+  libgl1 libglib2.0-0 \
+  libxcb-xinerama0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 \
+  libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 \
+  && rm -rf /var/lib/apt/lists/*
+
+# uv package manager (eng-ai-agents pattern)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Freeze constraint file to respect base image packages
+RUN mkdir -p /etc/pip \
+  && pip list --format=freeze > /etc/pip/constraint.txt
+
+# Python dependencies — no ROS packages whatsoever
+RUN pip install --no-cache-dir \
+  eclipse-zenoh \
+  pycdr2 \
+  numpy \
+  matplotlib \
+  pandas \
+  pyqtgraph \
+  PyQt5 \
+  opencv-python-headless
+
+# -----------------------------------------------------------------------------
+# Working directory & source code layout
+#
+# Preserve the turtlebot3_drl package hierarchy so that relative imports
+# (e.g. from ..common.settings) work unchanged.
+#
+#   /drl_agent/
+#     turtlebot3_drl/
+#       __init__.py
+#       drl_agent/      (agent modules)
+#       common/         (settings, replay buffer, storage, graph, etc.)
+#       drl_environment/
+#         __init__.py
+#         reward.py
+#         drl_environment.py   (stub: exports NUM_SCAN_SAMPLES without ROS)
+# -----------------------------------------------------------------------------
+WORKDIR /drl_agent
+
+# Copy agent and common packages (preserving parent package)
+COPY src/turtlebot3_drl/turtlebot3_drl/__init__.py /drl_agent/turtlebot3_drl/__init__.py
+COPY src/turtlebot3_drl/turtlebot3_drl/drl_agent/ /drl_agent/turtlebot3_drl/drl_agent/
+COPY src/turtlebot3_drl/turtlebot3_drl/common/ /drl_agent/turtlebot3_drl/common/
+
+# Copy reward function and environment __init__
+COPY src/turtlebot3_drl/turtlebot3_drl/drl_environment/__init__.py /drl_agent/turtlebot3_drl/drl_environment/__init__.py
+COPY src/turtlebot3_drl/turtlebot3_drl/drl_environment/reward.py /drl_agent/turtlebot3_drl/drl_environment/reward.py
+
+# Stub drl_environment.py — exports NUM_SCAN_SAMPLES from settings so that
+# agent modules (ddpg.py, off_policy_agent.py) can import it without ROS2.
+# The real drl_environment.py reads this from the Gazebo SDF at import time,
+# but the agent container has no Gazebo. REAL_N_SCAN_SAMPLES in settings.py
+# is the authoritative value (must match the SDF).
+RUN printf '%s\n' \
+  '"""Stub for agent container — no ROS2 dependencies."""' \
+  'from ..common.settings import REAL_N_SCAN_SAMPLES' \
+  'NUM_SCAN_SAMPLES = REAL_N_SCAN_SAMPLES' \
+  > /drl_agent/turtlebot3_drl/drl_environment/drl_environment.py
+
+# Model checkpoint volume mount point
+# StorageManager expects DRLNAV_BASE_PATH/src/turtlebot3_drl/model/
+RUN mkdir -p /drl_agent/src/turtlebot3_drl/model
+VOLUME /drl_agent/src/turtlebot3_drl/model
+
+# -----------------------------------------------------------------------------
+# NVIDIA runtime environment
+# -----------------------------------------------------------------------------
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV PYTHONUNBUFFERED=1
+
+# Switch to non-root user
+USER $USERNAME
+RUN git config --global commit.gpgsign false

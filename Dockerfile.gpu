@@ -1,0 +1,196 @@
+# ROS distribution to use
+ARG ROS_DISTRO=jazzy
+
+###############################################
+# Base Image for TurtleBot3 DRL Navigation    #
+###############################################
+FROM ros:${ROS_DISTRO} AS base
+ENV ROS_DISTRO=${ROS_DISTRO}
+SHELL ["/bin/bash", "-c"]
+
+# Install basic apt packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  curl git zsh wget unzip \
+  libcanberra-gtk-module libcanberra-gtk3-module \
+  fuse3 libfuse2 libqt5svg5-dev \
+  python3-pip python3-opencv python3-tk python3-pyqt5.qtwebengine
+
+# Minimal GL/Vulkan user-space (no NVIDIA driver packages here)
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+  libvulkan1 vulkan-tools \
+  libgl1 libegl1 libgles2 \
+  mesa-utils \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install additional Python modules
+RUN pip3 install \
+  matplotlib numpy pandas \
+  pyqtgraph \
+  eclipse-zenoh
+
+# Use Cyclone DDS as middleware
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  ros-${ROS_DISTRO}-rmw-cyclonedds-cpp
+ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+# Install zenoh-bridge-ros2dds for bridging DDS topics to Zenoh
+# See: https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds
+RUN apt-get update && apt-get install -y --no-install-recommends wget unzip \
+  && ZENOH_VERSION="1.7.2" \
+  && case "$(dpkg --print-architecture)" in \
+  amd64) ZENOH_ARCH="x86_64-unknown-linux-gnu" ;; \
+  arm64) ZENOH_ARCH="aarch64-unknown-linux-gnu" ;; \
+  armhf) ZENOH_ARCH="armv7-unknown-linux-gnueabihf" ;; \
+  *) echo "Unsupported architecture" && exit 1 ;; \
+  esac \
+  && wget -qO /tmp/zenoh-bridge.zip \
+  "https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds/releases/download/${ZENOH_VERSION}/zenoh-plugin-ros2dds-${ZENOH_VERSION}-${ZENOH_ARCH}-debian.zip" \
+  && unzip -o /tmp/zenoh-bridge.zip -d /tmp/zenoh-bridge \
+  && dpkg -i /tmp/zenoh-bridge/zenoh-bridge-ros2dds_*.deb \
+  && rm -rf /tmp/zenoh-bridge.zip /tmp/zenoh-bridge \
+  && rm -rf /var/lib/apt/lists/*
+
+# Create Colcon workspace
+RUN mkdir -p /turtlebot_ws/src
+WORKDIR /turtlebot_ws
+
+# Set TurtleBot3 model
+ENV TURTLEBOT3_MODEL=burger
+
+# Remove display warnings
+RUN mkdir /tmp/runtime-root
+ENV XDG_RUNTIME_DIR="/tmp/runtime-root"
+RUN chmod -R 0700 /tmp/runtime-root
+ENV NO_AT_BRIDGE=1
+
+###############################################
+# Overlay Image for TurtleBot3 DRL Navigation #
+###############################################
+FROM base AS overlay
+
+# Ensure GL/Vulkan packages are available
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+  libvulkan1 vulkan-tools mesa-vulkan-drivers \
+  libgl1 libegl1 libgles2 \
+  mesa-utils \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install Gazebo Classic packages for ROS Jazzy simulation
+# turtlebot3_gazebo depends on gazebo_ros_pkgs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  ros-${ROS_DISTRO}-gazebo-ros-pkgs \
+  ros-${ROS_DISTRO}-turtlebot3-description \
+  ros-${ROS_DISTRO}-nav2-bringup \
+  || echo "Some packages may not be available for ${ROS_DISTRO}, continuing..." \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install Gazebo Harmonic (gz-harmonic) packages for ROS Jazzy
+# Jazzy uses Gazebo Harmonic (gz-sim) via ros_gz bridge
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  ros-${ROS_DISTRO}-ros-gz \
+  ros-${ROS_DISTRO}-gz-sim-vendor \
+  ros-${ROS_DISTRO}-gz-transport-vendor \
+  ros-${ROS_DISTRO}-gz-msgs-vendor \
+  || echo "Some gz packages may not be available, continuing..." \
+  && rm -rf /var/lib/apt/lists/*
+
+# Copy source packages into the overlay workspace
+RUN mkdir -p /overlay_ws/src
+WORKDIR /overlay_ws
+
+COPY ./src/turtlebot3_msgs/ ./src/turtlebot3_msgs/
+COPY ./src/turtlebot3_simulations/ ./src/turtlebot3_simulations/
+COPY ./src/turtlebot3_drl/ ./src/turtlebot3_drl/
+
+# Build the overlay workspace
+RUN source /opt/ros/${ROS_DISTRO}/setup.bash \
+  && apt-get update \
+  && rosdep install --from-paths src --ignore-src --rosdistro ${ROS_DISTRO} -y \
+  || echo "Some rosdep dependencies unavailable, continuing..." \
+  && apt-get install -y --no-install-recommends vulkan-tools mesa-vulkan-drivers \
+  && colcon build --symlink-install --packages-ignore turtlebot3_fake_node \
+  && rm -rf /var/lib/apt/lists/*
+
+# Set Gazebo model and plugin paths for turtlebot3
+ENV DRLNAV_BASE_PATH="/overlay_ws"
+ENV GAZEBO_MODEL_PATH="/overlay_ws/src/turtlebot3_simulations/turtlebot3_gazebo/models:${GAZEBO_MODEL_PATH}"
+ENV GAZEBO_PLUGIN_PATH="/overlay_ws/src/turtlebot3_simulations/turtlebot3_gazebo/models/turtlebot3_drl_world/obstacle_plugin/lib:${GAZEBO_PLUGIN_PATH}"
+
+# Also set GZ_SIM_RESOURCE_PATH for Gazebo Harmonic
+ENV GZ_SIM_RESOURCE_PATH="/overlay_ws/src/turtlebot3_simulations/turtlebot3_gazebo/models:${GZ_SIM_RESOURCE_PATH}"
+
+# Set up the entrypoint
+COPY ./docker/entrypoint.sh /
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT [ "/entrypoint.sh" ]
+WORKDIR /overlay_ws
+
+###################################
+# Development Image               #
+###################################
+FROM overlay AS dev
+
+# Dev container arguments
+ARG USERNAME=devuser
+ARG UID=1000
+ARG GID=${UID}
+
+# Install extra tools for development
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  gdb gdbserver nano tmux htop \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install PyTorch (CPU version by default; mount NVIDIA runtime for GPU)
+RUN pip3 install --break-system-packages \
+  torch --index-url https://download.pytorch.org/whl/cpu \
+  || echo "PyTorch installation skipped"
+
+# In Ubuntu 24.04, there is already a user named "ubuntu" with UID 1000.
+# Delete this in the (common) event that the user on the host also has this UID.
+RUN touch /var/mail/ubuntu \
+  && chown ubuntu /var/mail/ubuntu \
+  && userdel -r ubuntu \
+  || true
+
+# Create new user and home directory
+RUN groupadd --gid $GID $USERNAME \
+  && useradd --uid ${GID} --gid ${UID} --create-home ${USERNAME} \
+  && echo ${USERNAME} ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/${USERNAME} \
+  && chmod 0440 /etc/sudoers.d/${USERNAME} \
+  && mkdir -p /home/${USERNAME} \
+  && chown -R ${UID}:${GID} /home/${USERNAME}
+
+# Set the ownership of the overlay workspace to the new user
+RUN chown -R ${UID}:${GID} /overlay_ws/
+
+# Set up volume mount points for source code (allows live editing)
+VOLUME ["/overlay_ws/src/turtlebot3_drl"]
+VOLUME ["/overlay_ws/src/turtlebot3_simulations"]
+VOLUME ["/overlay_ws/src/turtlebot3_msgs"]
+
+# Set up the entrypoint and shell configuration
+USER ${USERNAME}
+RUN echo "source /entrypoint.sh" >> /home/${USERNAME}/.bashrc \
+  && echo "\n\
+  source /opt/ros/${ROS_DISTRO}/setup.bash\n\
+  [ -f /overlay_ws/install/setup.bash ] && source /overlay_ws/install/setup.bash\n\
+  export ROS_DOMAIN_ID=1\n\
+  export DRLNAV_BASE_PATH='/overlay_ws'\n\
+  export TURTLEBOT3_MODEL=burger\n\
+  export GAZEBO_MODEL_PATH=/overlay_ws/src/turtlebot3_simulations/turtlebot3_gazebo/models:\$GAZEBO_MODEL_PATH\n\
+  export GAZEBO_PLUGIN_PATH=/overlay_ws/src/turtlebot3_simulations/turtlebot3_gazebo/models/turtlebot3_drl_world/obstacle_plugin/lib:\$GAZEBO_PLUGIN_PATH\n\
+  export GZ_SIM_RESOURCE_PATH=/overlay_ws/src/turtlebot3_simulations/turtlebot3_gazebo/models:\$GZ_SIM_RESOURCE_PATH\n\
+  " >> /home/${USERNAME}/.bashrc \
+  && { echo '# Source ROS 2 workspaces (zsh-native setup files)'; \
+  echo '[ -f /opt/ros/${ROS_DISTRO}/setup.zsh ] && source /opt/ros/${ROS_DISTRO}/setup.zsh'; \
+  echo '[ -f /overlay_ws/install/setup.zsh ] && source /overlay_ws/install/setup.zsh'; \
+  echo 'export ROS_DOMAIN_ID=1'; \
+  echo 'export DRLNAV_BASE_PATH="/overlay_ws"'; \
+  echo 'export TURTLEBOT3_MODEL=burger'; \
+  echo 'export GAZEBO_MODEL_PATH=/overlay_ws/src/turtlebot3_simulations/turtlebot3_gazebo/models:$GAZEBO_MODEL_PATH'; \
+  echo 'export GAZEBO_PLUGIN_PATH=/overlay_ws/src/turtlebot3_simulations/turtlebot3_gazebo/models/turtlebot3_drl_world/obstacle_plugin/lib:$GAZEBO_PLUGIN_PATH'; \
+  echo 'export GZ_SIM_RESOURCE_PATH=/overlay_ws/src/turtlebot3_simulations/turtlebot3_gazebo/models:$GZ_SIM_RESOURCE_PATH'; \
+  } >> /home/${USERNAME}/.zshrc
+
+WORKDIR /overlay_ws
+CMD ["bash"]

@@ -1,0 +1,5 @@
+rclpy
+numpy
+ultralytics
+eclipse-zenoh
+opencv-python-headless

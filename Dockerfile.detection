@@ -1,0 +1,13 @@
+FROM ros:humble
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-pip python3-opencv \
+    ros-humble-tf2-ros \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install ultralytics eclipse-zenoh numpy opencv-python-headless
+
+WORKDIR /app
+COPY detection_node/detector.py .
+
+CMD ["bash", "-c", "source /opt/ros/humble/setup.bash && python3 detector.py"]

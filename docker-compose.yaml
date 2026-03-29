@@ -1,0 +1,246 @@
+# Docker Compose file for TurtleBot3 DRL Navigation
+#
+# Usage:
+#
+# To build the images:
+#   docker compose build
+#
+# To start the full training pipeline (simulation + environment + goals + agent):
+#   docker compose up simulation environment gazebo-goals drl-agent
+#
+# To start only the simulation:
+#   docker compose up simulation
+#
+# To open an interactive shell to a running container:
+#   docker exec -it <container_name> bash
+#
+# To start the dev container:
+#   docker compose --profile dev up dev
+
+services:
+  # Base image containing dependencies (not started directly).
+  base:
+    image: turtlebot3_drlnav:base
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+      args:
+        ROS_DISTRO: ${ROS_DISTRO:-jazzy}
+      target: base
+    # Interactive shell
+    stdin_open: true
+    tty: true
+    # Networking and IPC for ROS 2 / Zenoh multicast discovery
+    network_mode: bridge
+    ipc: host
+    # Needed to display graphical applications
+    privileged: true
+    environment:
+      - TURTLEBOT3_MODEL=${TURTLEBOT3_MODEL:-burger}
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-1}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - DRLNAV_BASE_PATH=/overlay_ws
+    volumes: []
+      # Allows graphical programs in the container
+      # - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # - ${XAUTHORITY:-$HOME/.Xauthority}:/root/.Xauthority
+
+  # Overlay image containing the built source code.
+  overlay:
+    extends: base
+    image: turtlebot3_drlnav:overlay
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+      target: overlay
+
+  # ---------------------------------------------------------------------------
+  # Gazebo simulation (launches the DRL stage world)
+  # ---------------------------------------------------------------------------
+  simulation:
+    extends: overlay
+    container_name: drlnav-simulation
+    command: >
+      ros2 launch turtlebot3_gazebo turtlebot3_drl_stage${DRL_STAGE:-4}.launch.py
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+    # ---------------------------------------------------------------------------
+    # DRL environment node (reward computation, state observation)
+    # ---------------------------------------------------------------------------
+  environment:
+    extends: overlay
+    container_name: drlnav-environment
+    command: >
+      ros2 run turtlebot3_drl environment
+    depends_on:
+      - simulation
+
+  # ---------------------------------------------------------------------------
+  # Goal spawner (places / moves goal markers in Gazebo)
+  # ---------------------------------------------------------------------------
+  gazebo-goals:
+    extends: overlay
+    container_name: drlnav-gazebo-goals
+    command: >
+      ros2 run turtlebot3_drl gazebo_goals
+    depends_on:
+      - simulation
+
+  # ---------------------------------------------------------------------------
+  # DRL training / testing agent (PyTorch GPU, no ROS dependencies)
+  # ---------------------------------------------------------------------------
+  drl-agent:
+    image: turtlebot3_drlnav:agent
+    build:
+      context: .
+      dockerfile: Dockerfile.torch.gpu
+    container_name: drlnav-agent
+    stdin_open: true
+    tty: true
+    network_mode: bridge
+    ipc: host
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - DRLNAV_BASE_PATH=/drl_agent
+      - DISPLAY=${DISPLAY}
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    volumes:
+      # Persist trained model checkpoints on the host
+      - ./src/turtlebot3_drl/model:/drl_agent/src/turtlebot3_drl/model
+    depends_on:
+      - environment
+      - gazebo-goals
+    # DRL_MODE: train | test
+    # DRL_ALGORITHM: ddpg | td3 | dqn
+    # Note: No ROS in this container. Agent entry point runs directly via Python.
+    command: >
+      python -m turtlebot3_drl.drl_agent.drl_agent --mode ${DRL_MODE:-train} --algorithm ${DRL_ALGORITHM:-ddpg}
+
+  # ---------------------------------------------------------------------------
+  # Zenoh router (optional, for multi-host setups)
+  # ---------------------------------------------------------------------------
+  zenoh-router:
+    image: eclipse/zenoh:latest
+    container_name: drlnav-zenoh-router
+    network_mode: host
+    ipc: host
+    command: [ "--adminspace-permissions", "rw" ]
+    profiles:
+      - zenoh
+
+  # ---------------------------------------------------------------------------
+  # Zenoh DDS bridge (exposes ROS 2 DDS topics as Zenoh keys)
+  # ---------------------------------------------------------------------------
+  zenoh-bridge:
+    extends: overlay
+    container_name: drlnav-zenoh-bridge
+    network_mode: host
+    ipc: host
+    command: zenoh-bridge-ros2dds -e tcp/localhost:7447 client
+    depends_on:
+      - simulation
+    profiles:
+      - zenoh
+
+  # ---------------------------------------------------------------------------
+  # Development container (live source editing, only starts with --profile dev)
+  # ---------------------------------------------------------------------------
+  dev:
+    extends: overlay
+    image: turtlebot3_drlnav:dev
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+      target: dev
+      args:
+        - UID=${UID:-1000}
+        - GID=${UID:-1000}
+        - USERNAME=${USERNAME:-devuser}
+    container_name: drlnav-dev
+    volumes:
+      # Mount source code for live editing
+      - ./src/turtlebot3_drl:/overlay_ws/src/turtlebot3_drl:rw
+      - ./src/turtlebot3_simulations:/overlay_ws/src/turtlebot3_simulations:rw
+      - ./src/turtlebot3_msgs:/overlay_ws/src/turtlebot3_msgs:rw
+      # Mount colcon build artifacts for faster rebuilds
+      - ./.colcon/build/:/overlay_ws/build/:rw
+      - ./.colcon/install/:/overlay_ws/install/:rw
+      - ./.colcon/log/:/overlay_ws/log/:rw
+    user: ${USERNAME:-devuser}
+    command: sleep infinity
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    profiles:
+      - dev
+
+  # ---------------------------------------------------------------------------
+  # Assignment 2: Detection pipeline
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    container_name: a2-postgres
+    environment:
+      POSTGRES_DB: detections
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+
+  zenoh:
+    image: eclipse/zenoh:latest
+    container_name: a2-zenoh
+    network_mode: bridge
+    command: [ "--adminspace-permissions", "rw" ]
+
+  detection:
+    build:
+      context: .
+      dockerfile: Dockerfile.detection
+    platform: linux/amd64
+    container_name: a2-detection
+    network_mode: bridge
+    ipc: host
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-1}
+    depends_on:
+      - simulation
+      - zenoh
+
+  ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest
+    container_name: a2-ingest
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: detections
+      DB_USER: postgres
+      DB_PASS: postgres
+    depends_on:
+      - postgres
+      - zenoh
